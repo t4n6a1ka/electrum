@@ -20,6 +20,7 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import asyncio
 import time
 import queue
 import os
@@ -32,7 +33,7 @@ import json
 import sys
 import ipaddress
 import asyncio
-from typing import NamedTuple, Optional, Sequence, List, Dict, Tuple
+from typing import NamedTuple, Optional, Sequence, List, Dict, Tuple, TYPE_CHECKING
 import traceback
 
 import dns
@@ -59,8 +60,14 @@ from .simple_config import SimpleConfig
 from .i18n import _
 from .logging import get_logger, Logger
 
+if TYPE_CHECKING:
+    from .channel_db import ChannelDB
+    from .lnworker import LNGossip
+    from .lnwatcher import WatchTower
+
 
 _logger = get_logger(__name__)
+
 
 
 NODES_RETRY_INTERVAL = 60
@@ -217,7 +224,7 @@ class UntrustedServerReturnedError(NetworkException):
         return f"<UntrustedServerReturnedError original_exception: {repr(self.original_exception)}>"
 
 
-INSTANCE = None
+_INSTANCE = None
 
 
 class Network(Logger):
@@ -227,9 +234,10 @@ class Network(Logger):
 
     LOGGING_SHORTCUT = 'n'
 
-    def __init__(self, config: SimpleConfig=None):
-        global INSTANCE
-        INSTANCE = self
+    def __init__(self, config: SimpleConfig):
+        global _INSTANCE
+        assert _INSTANCE is None, "Network is a singleton!"
+        _INSTANCE = self
 
         Logger.__init__(self)
 
@@ -237,9 +245,8 @@ class Network(Logger):
         assert self.asyncio_loop.is_running(), "event loop not running"
         self._loop_thread = None  # type: threading.Thread  # set by caller; only used for sanity checks
 
-        if config is None:
-            config = {}  # Do not use mutables as default values!
-        self.config = SimpleConfig(config) if isinstance(config, dict) else config  # type: SimpleConfig
+        assert isinstance(config, SimpleConfig), f"config should be a SimpleConfig instead of {type(config)}"
+        self.config = config
         blockchain.read_blockchains(self.config)
         self.logger.info(f"blockchains {list(map(lambda b: b.forkpoint, blockchain.blockchains.values()))}")
         self._blockchain_preferred_block = self.config.get('blockchain_preferred_block', None)  # type: Optional[Dict]
@@ -294,14 +301,29 @@ class Network(Logger):
 
         self._set_status('disconnected')
 
-    def run_from_another_thread(self, coro):
+        # lightning network
+        if self.config.get('lightning'):
+            from . import lnwatcher
+            from . import lnworker
+            from . import lnrouter
+            from . import channel_db
+            self.channel_db = channel_db.ChannelDB(self)
+            self.path_finder = lnrouter.LNPathFinder(self.channel_db)
+            self.lngossip = lnworker.LNGossip(self)
+            self.local_watchtower = lnwatcher.WatchTower(self) if self.config.get('local_watchtower', False) else None
+        else:
+            self.channel_db = None  # type: Optional[ChannelDB]
+            self.lngossip = None  # type: Optional[LNGossip]
+            self.local_watchtower = None  # type: Optional[WatchTower]
+
+    def run_from_another_thread(self, coro, *, timeout=None):
         assert self._loop_thread != threading.current_thread(), 'must not be called from network thread'
         fut = asyncio.run_coroutine_threadsafe(coro, self.asyncio_loop)
-        return fut.result()
+        return fut.result(timeout)
 
     @staticmethod
     def get_instance() -> Optional["Network"]:
-        return INSTANCE
+        return _INSTANCE
 
     def with_recent_servers_lock(func):
         def func_wrapper(self, *args, **kwargs):
@@ -1053,6 +1075,11 @@ class Network(Logger):
             raise Exception(f"{repr(sh)} is not a scripthash")
         return await self.interface.session.send_request('blockchain.scripthash.get_balance', [sh])
 
+    @best_effort_reliable
+    async def get_txid_from_txpos(self, tx_height, tx_pos, merkle):
+        command = 'blockchain.transaction.id_from_pos'
+        return await self.interface.session.send_request(command, [tx_height, tx_pos, merkle])
+
     def blockchain(self) -> Blockchain:
         interface = self.interface
         if interface and interface.blockchain is not None:
@@ -1130,6 +1157,12 @@ class Network(Logger):
         self._set_oneserver(self.config.get('oneserver', False))
         self._start_interface(self.default_server)
 
+        if self.lngossip:
+            self.lngossip.start_network(self)
+        if self.local_watchtower:
+            self.local_watchtower.start_network(self)
+            await self.local_watchtower.start_watching()
+
         async def main():
             try:
                 await self._init_headers_file()
@@ -1138,8 +1171,8 @@ class Network(Logger):
                 async with main_taskgroup as group:
                     await group.spawn(self._maintain_sessions())
                     [await group.spawn(job) for job in self._jobs]
-            except Exception as e:
-                self.logger.exception('')
+            except BaseException as e:
+                self.logger.exception('main_taskgroup died.')
                 raise e
         asyncio.run_coroutine_threadsafe(main(), self.asyncio_loop)
 
